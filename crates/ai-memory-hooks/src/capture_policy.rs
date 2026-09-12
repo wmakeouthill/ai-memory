@@ -858,11 +858,25 @@ fn family(name: &str) -> ToolFamily {
         | "fs_read"
         | "fs_write" => ToolFamily::File,
         "read_file" | "write_file" | "edit_file" | "patch" => ToolFamily::File,
+        "view_code_item" | "view_line_range" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
-        | "list_dir" | "grep_search" | "search_files" | "find_by_name" => ToolFamily::SearchList,
+        | "list_dir" | "grep_search" | "search_files" | "find_by_name" | "codebase_search"
+        | "search_in_file" => ToolFamily::SearchList,
         "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
         | "search_web" | "manage_task" | "manage_subagents" | "terminal" | "execute_bash"
         | "execute_cmd" => ToolFamily::NonFile,
+        // Patch local: shell/agente do Claude Code e tools do Antigravity que
+        // caiam em `Unknown` (observacao sem corpo, titulo "tool unknown").
+        "powershell"
+        | "pwsh"
+        | "task"
+        | "skill"
+        | "command_status"
+        | "read_terminal"
+        | "create_memory"
+        | "todo_write"
+        | "todowrite"
+        | "suggested_responses" => ToolFamily::NonFile,
         // Hermes Agent tool surface (agent/shell_hooks.py envelope; tool
         // names from model_tools registry, live-captured 2026-10-07). These
         // execute code, drive a browser, or fetch the web — none touch
@@ -1761,6 +1775,34 @@ mod tests {
             ExtractionState::UnsupportedSchema
         );
         assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    /// Um nome nao classificado vira `ToolFamily::Unknown`, e `safe_tool_body`
+    /// descarta o resultado inteiro nesse caso: sobra uma observacao sem corpo
+    /// e sem titulo util. Os tools de shell/agente do Claude Code precisam
+    /// estar no mapa por isso.
+    #[test]
+    fn claude_code_shell_and_agent_tools_are_non_file_not_unknown() {
+        for tool in ["powershell", "pwsh", "task", "skill"] {
+            assert_eq!(family(tool), ToolFamily::NonFile, "tool: {tool}");
+        }
+        // Ferramentas que o antigravity chama de verdade e que caiam em
+        // `Unknown` viravam observacao vazia com titulo "tool unknown".
+        for tool in [
+            "search_web",
+            "command_status",
+            "read_terminal",
+            "todo_write",
+            "suggested_responses",
+        ] {
+            assert_eq!(family(tool), ToolFamily::NonFile, "tool: {tool}");
+        }
+        for tool in ["codebase_search", "find_by_name"] {
+            assert_eq!(family(tool), ToolFamily::SearchList, "tool: {tool}");
+        }
+        for tool in ["view_code_item", "view_line_range"] {
+            assert_eq!(family(tool), ToolFamily::File, "tool: {tool}");
+        }
     }
 
     #[test]
