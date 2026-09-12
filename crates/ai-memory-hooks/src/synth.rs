@@ -190,7 +190,14 @@ fn tally_session(observations: &[Observation]) -> SessionTally<'_> {
             // that never produced a post (cancellations) are intentionally
             // excluded.
             ObservationKind::PostToolUse if !obs.title.is_empty() => {
-                *tally.tool_counts.entry(obs.title.as_str()).or_insert(0) += 1;
+                // O titulo carrega o comando ("Bash: git status"), entao contar
+                // o titulo inteiro so duplicaria "Raw observations". Agrupa pelo
+                // nome da ferramenta, antes do primeiro ":".
+                let name = obs
+                    .title
+                    .split_once(": ")
+                    .map_or(obs.title.as_str(), |(name, _)| name);
+                *tally.tool_counts.entry(name).or_insert(0) += 1;
             }
             _ => {}
         }
@@ -846,6 +853,34 @@ mod tests {
         assert_eq!(
             derive_title(&with_prompt, test_session_id()),
             "fix the auth bug"
+        );
+    }
+
+    /// Depois que o titulo passou a carregar o comando, contar o titulo inteiro
+    /// daria uma linha por chamada -- o mesmo que "Raw observations" ja mostra.
+    /// O histograma agrupa pelo nome da ferramenta.
+    #[test]
+    fn tool_counts_group_by_tool_name_not_by_full_title() {
+        let observations = vec![
+            obs(ObservationKind::PostToolUse, "Bash: git status"),
+            obs(ObservationKind::PostToolUse, "Bash: cargo test -q"),
+            obs(ObservationKind::PostToolUse, "Read: D:/w/x.rs  ->  412 linhas"),
+            obs(ObservationKind::PostToolUse, "######## codex ########"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::AntigravityCli,
+            &observations,
+        );
+        assert!(page.body.contains("`Bash`: 2"), "{}", page.body);
+        assert!(page.body.contains("`Read`: 1"), "{}", page.body);
+        // Sem ":" o titulo inteiro vira o balde, em vez de sumir da contagem.
+        assert!(
+            page.body.contains("`######## codex ########`: 1"),
+            "{}",
+            page.body
         );
     }
 

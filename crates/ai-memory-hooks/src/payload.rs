@@ -523,21 +523,6 @@ impl HookEnvelope {
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
-        let title_hint = if closed_tool_event {
-            tool_metadata.as_ref().map(safe_tool_title).or_else(|| {
-                (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
-                    .then(|| legacy_tool_title(event, agent, &raw))
-                    .flatten()
-            })
-        } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
-            legacy_tool_title(event, agent, &raw)
-        } else {
-            best_title_hint(event, &raw).or_else(|| {
-                source_event
-                    .as_deref()
-                    .map(|source| extension_title_hint(&raw, source))
-            })
-        };
         let body_excerpt = if closed_tool_event {
             safe_tool_body(event, tool_metadata.as_ref(), agent, &raw).or_else(|| {
                 (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
@@ -551,6 +536,22 @@ impl HookEnvelope {
                 source_event
                     .as_deref()
                     .and_then(|_| extension_body_excerpt(&raw))
+            })
+        };
+        let title_hint = if closed_tool_event {
+            // OpenCode expoe o nome real da ferramenta; ele ganha da saida.
+            (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+                .then(|| legacy_tool_title(event, agent, &raw))
+                .flatten()
+                .or_else(|| body_excerpt.as_deref().and_then(tool_result_title))
+                .or_else(|| tool_metadata.as_ref().map(safe_tool_title))
+        } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
+            legacy_tool_title(event, agent, &raw)
+        } else {
+            best_title_hint(event, &raw).or_else(|| {
+                source_event
+                    .as_deref()
+                    .map(|source| extension_title_hint(&raw, source))
             })
         };
         let ingest_key = query.ingest_key.filter(|k| valid_ingest_key(k));
@@ -660,6 +661,29 @@ pub(crate) fn is_safe_tool_title(title: &str) -> bool {
     })
 }
 
+/// Placeholder `safe_tool_body` writes when a tool produced no capturable
+/// result. Never a useful observation title.
+const NO_TOOL_OUTPUT: &str = "(no output captured)";
+
+/// Title for a closed-agent tool observation, taken from the first non-empty
+/// line of the captured result (everything after the `---` separator that
+/// `safe_tool_body` writes).
+///
+/// Closed agents (Claude Code, Antigravity, ...) only expose `tool_family`, so
+/// `safe_tool_title` can never say more than "tool non-file". When a hook
+/// wrapper puts a real summary in the result ("Read: <path>",
+/// "run_command: cargo test"), that line is the useful heading and is what
+/// ends up in `log-YYYY-MM.md`. Falls back to `safe_tool_title` when the
+/// result has no separator or is empty.
+fn tool_result_title(body: &str) -> Option<String> {
+    let result = body.split_once("\n---\n")?.1;
+    let line = result.lines().find(|l| !l.trim().is_empty())?.trim();
+    if line == NO_TOOL_OUTPUT {
+        return None;
+    }
+    Some(truncate_for_title(line))
+}
+
 fn safe_tool_body(
     event: HookEvent,
     metadata: Option<&ToolObservationMetadata>,
@@ -694,7 +718,7 @@ fn safe_tool_body(
                     .or_else(|| extract_content(raw, &["error"]))
                     .or_else(|| antigravity_edit_content(agent, raw))
             }
-            .unwrap_or_else(|| "(no output captured)".into());
+            .unwrap_or_else(|| NO_TOOL_OUTPUT.into());
             summary.push_str("\n---\n");
             summary.push_str(&result);
             Some(truncate_excerpt(&summary))
@@ -928,7 +952,7 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
             let result =
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
-                    .unwrap_or_else(|| "(no output captured)".into());
+                    .unwrap_or_else(|| NO_TOOL_OUTPUT.into());
             Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
         }
         HookEvent::Notification => extract_content(raw, &["message", "text"])
@@ -1953,11 +1977,33 @@ mod tests {
         assert_eq!(env.agent, AgentKind::Other);
     }
 
+    #[test]
+    fn tool_result_title_prefers_the_wrapper_summary_over_tool_family() {
+        // O que safe_tool_body monta para um post-tool-use de agente fechado.
+        let body = "tool_family: file\ntool_call_id: toolu_01AB\noutcome: success\n---\nRead: D:/w/x.rs  ->  412 linhas";
+        assert_eq!(
+            tool_result_title(body).as_deref(),
+            Some("Read: D:/w/x.rs  ->  412 linhas")
+        );
+
+        // pre-tool-use nao tem separador: sem titulo, cai no safe_tool_title.
+        assert!(tool_result_title("tool_family: non-file\ntool_call_id: toolu_01AB").is_none());
+
+        // resultado vazio tambem cai no fallback.
+        assert!(tool_result_title("tool_family: file\noutcome: success\n---\n   \n").is_none());
+
+        // titulo longo respeita o corte padrao de 80 chars.
+        let longo = format!("tool_family: file\noutcome: success\n---\n{}", "x".repeat(500));
+        let t = tool_result_title(&longo).expect("titulo");
+        assert!(t.chars().count() <= 80, "titulo com {} chars", t.chars().count());
+    }
+
     /// Title-hint extraction must truncate at the first newline (the
     /// "first line" rule used everywhere in the wiki log + handoff
     /// surfaces) and cap at 80 chars to keep observation titles
     /// scannable in the log.md heading.
     #[test]
+
     fn user_prompt_title_truncates_at_newline_and_at_max_chars() {
         let q = HookQuery {
             event: "user-prompt".into(),
@@ -2230,7 +2276,14 @@ mod tests {
                 assert_eq!(env.agent, AgentKind::Codex);
                 assert_eq!(env.session_id.as_deref(), Some("native-codex"));
                 assert_eq!(env.cwd.as_deref(), Some("/repo"));
-                assert_eq!(env.title_hint, Some(format!("tool {family}")));
+                // Patch local: no post-tool-use o titulo vem da primeira linha
+                // do resultado (`tool_result_title`); "tool <family>" e so o
+                // fallback do pre-tool-use, que nao tem resultado.
+                if event == "PreToolUse" {
+                    assert_eq!(env.title_hint, Some(format!("tool {family}")));
+                } else {
+                    assert!(env.title_hint.as_deref().is_some_and(|t| !t.is_empty()));
+                }
                 let body = env.body_excerpt.unwrap();
                 assert!(body.starts_with(&format!(
                     "tool_family: {family}\ntool_call_id: call-native-1"
