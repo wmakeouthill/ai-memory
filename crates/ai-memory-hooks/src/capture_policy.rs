@@ -677,10 +677,14 @@ fn family(name: &str) -> ToolFamily {
         | "fs_read"
         | "fs_write" => ToolFamily::File,
         "read_file" | "write_file" | "edit_file" | "patch" => ToolFamily::File,
+        "view_code_item" | "view_line_range" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
-        | "list_dir" | "grep_search" | "search_files" => ToolFamily::SearchList,
+        | "list_dir" | "grep_search" | "search_files" | "codebase_search" | "find_by_name"
+        | "search_in_file" => ToolFamily::SearchList,
         "bash" | "shell" | "shell_command" | "execute" | "run_command" | "web_search"
-        | "terminal" | "execute_bash" | "execute_cmd" => ToolFamily::NonFile,
+        | "terminal" | "execute_bash" | "execute_cmd" | "powershell" | "pwsh" | "task"
+        | "skill" | "search_web" | "command_status" | "read_terminal" | "create_memory"
+        | "todo_write" | "todowrite" | "suggested_responses" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
@@ -1153,6 +1157,34 @@ mod tests {
             ExtractionState::UnsupportedSchema
         );
         assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    /// Um nome nao classificado vira `ToolFamily::Unknown`, e `safe_tool_body`
+    /// descarta o resultado inteiro nesse caso: sobra uma observacao sem corpo
+    /// e sem titulo util. Os tools de shell/agente do Claude Code precisam
+    /// estar no mapa por isso.
+    #[test]
+    fn claude_code_shell_and_agent_tools_are_non_file_not_unknown() {
+        for tool in ["powershell", "pwsh", "task", "skill"] {
+            assert_eq!(family(tool), ToolFamily::NonFile, "tool: {tool}");
+        }
+        // Ferramentas que o antigravity chama de verdade e que caiam em
+        // `Unknown` viravam observacao vazia com titulo "tool unknown".
+        for tool in [
+            "search_web",
+            "command_status",
+            "read_terminal",
+            "todo_write",
+            "suggested_responses",
+        ] {
+            assert_eq!(family(tool), ToolFamily::NonFile, "tool: {tool}");
+        }
+        for tool in ["codebase_search", "find_by_name"] {
+            assert_eq!(family(tool), ToolFamily::SearchList, "tool: {tool}");
+        }
+        for tool in ["view_code_item", "view_line_range"] {
+            assert_eq!(family(tool), ToolFamily::File, "tool: {tool}");
+        }
     }
 
     #[test]
