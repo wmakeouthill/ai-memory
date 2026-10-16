@@ -659,21 +659,6 @@ impl HookEnvelope {
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
-        let title_hint = if closed_tool_event {
-            tool_metadata.as_ref().map(safe_tool_title).or_else(|| {
-                (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
-                    .then(|| legacy_tool_title(event, agent, &raw))
-                    .flatten()
-            })
-        } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
-            legacy_tool_title(event, agent, &raw)
-        } else {
-            best_title_hint(event, &raw).or_else(|| {
-                source_event
-                    .as_deref()
-                    .map(|source| extension_title_hint(&raw, source))
-            })
-        };
         let body_excerpt = if closed_tool_event {
             safe_tool_body(event, tool_metadata.as_ref(), agent, &raw).or_else(|| {
                 (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
@@ -687,6 +672,22 @@ impl HookEnvelope {
                 source_event
                     .as_deref()
                     .and_then(|_| extension_body_excerpt(&raw))
+            })
+        };
+        let title_hint = if closed_tool_event {
+            // OpenCode expoe o nome real da ferramenta; ele ganha da saida.
+            (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
+                .then(|| legacy_tool_title(event, agent, &raw))
+                .flatten()
+                .or_else(|| body_excerpt.as_deref().and_then(tool_result_title))
+                .or_else(|| tool_metadata.as_ref().map(safe_tool_title))
+        } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
+            legacy_tool_title(event, agent, &raw)
+        } else {
+            best_title_hint(event, &raw).or_else(|| {
+                source_event
+                    .as_deref()
+                    .map(|source| extension_title_hint(&raw, source))
             })
         };
         let ingest_key = query.ingest_key.filter(|k| valid_ingest_key(k));
@@ -878,6 +879,32 @@ pub(crate) fn tool_family_from_title(title: &str) -> Option<ToolFamily> {
     serde_json::from_value::<ToolFamily>(serde_json::Value::String(family.to_owned())).ok()
 }
 
+/// Placeholder `safe_tool_body` writes when a tool produced no capturable
+/// result. Never a useful observation title.
+const NO_TOOL_OUTPUT: &str = "(no output captured)";
+
+/// Title for a closed-agent tool observation, taken from the first non-empty
+/// line of the captured result (everything after the `---` separator that
+/// `safe_tool_body` writes).
+///
+/// Closed agents (Claude Code, Antigravity, ...) only expose `tool_family`, so
+/// `safe_tool_title` can never say more than "tool non-file". When a hook
+/// wrapper puts a real summary in the result ("Read: <path>",
+/// "run_command: cargo test"), that line is the useful heading and is what
+/// ends up in `log-YYYY-MM.md`. Falls back to `safe_tool_title` when the
+/// result has no separator or is empty.
+///
+/// Returns the full line: the 80-char cap is `Sanitized::new`'s job, after
+/// redaction (#980) — cutting here could split a secret before the scrub.
+fn tool_result_title(body: &str) -> Option<String> {
+    let result = body.split_once("\n---\n")?.1;
+    let line = result.lines().find(|l| !l.trim().is_empty())?.trim();
+    if line == NO_TOOL_OUTPUT {
+        return None;
+    }
+    Some(line.to_string())
+}
+
 fn safe_tool_body(
     event: HookEvent,
     metadata: Option<&ToolObservationMetadata>,
@@ -931,7 +958,7 @@ fn safe_tool_body(
                     .or_else(|| extract_content(raw, &["error"]))
                     .or_else(|| antigravity_edit_content(agent, raw))
             }
-            .unwrap_or_else(|| "(no output captured)".into());
+            .unwrap_or_else(|| NO_TOOL_OUTPUT.into());
             summary.push_str("\n---\n");
             summary.push_str(&result);
             Some(summary)
@@ -1173,7 +1200,7 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
             let result =
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
-                    .unwrap_or_else(|| "(no output captured)".into());
+                    .unwrap_or_else(|| NO_TOOL_OUTPUT.into());
             Some(format!("tool: {tool}\n---\n{result}"))
         }
         HookEvent::Notification => extract_content(raw, &["message", "text"]),
@@ -2272,7 +2299,13 @@ mod tests {
         );
         let body = env.body_excerpt.expect("post-tool-use body");
         assert!(body.contains("tool_family: non-file"), "body: {body}");
-        assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
+        // Patch local: titulo vem do resultado (`tool_result_title`), nunca do
+        // `tool_input`.
+        let title = env.title_hint.as_deref().expect("title");
+        assert!(
+            !title.is_empty() && !title.contains("print(1)"),
+            "title: {title}"
+        );
         assert!(
             body.contains("outcome: success"),
             "status ok must map to success — body: {body}"
@@ -2460,7 +2493,9 @@ mod tests {
             raw,
         );
         assert_eq!(env.agent, AgentKind::Grizzybot);
-        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        // Patch local: post-tool-use titula pela 1a linha do resultado
+        // (`tool_result_title`), nunca pelo argumento.
+        assert_eq!(env.title_hint.as_deref(), Some("ok"));
         assert_eq!(env.session_id.as_deref(), Some("gb-session"));
         assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
     }
@@ -2489,7 +2524,11 @@ mod tests {
             raw,
         );
         assert_eq!(env.agent, AgentKind::Droid);
-        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        // Patch local: titulo = 1a linha do resultado (`tool_result_title`).
+        assert_eq!(
+            env.title_hint.as_deref(),
+            Some(r#"{"filePath":"/repo/notes.md","success":true}"#)
+        );
         assert_eq!(env.session_id.as_deref(), Some("droid-session"));
         let body = env.body_excerpt.expect("post-tool-use body");
         assert!(body.starts_with("tool_family: file\n"), "{body}");
@@ -2529,7 +2568,14 @@ mod tests {
             raw,
         );
         assert_eq!(env.agent, AgentKind::Muse);
-        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        // Patch local: titulo = 1a linha do resultado (`tool_result_title`).
+        assert!(
+            env.title_hint
+                .as_deref()
+                .is_some_and(|t| t.starts_with(r#"{"filePath":"/repo/notes.txt""#)),
+            "{:?}",
+            env.title_hint
+        );
         assert_eq!(
             env.session_id.as_deref(),
             Some("01a13669-dc61-7a72-b5ec-ad2f300ffd26")
@@ -2624,6 +2670,36 @@ mod tests {
         assert_eq!(body(serde_json::json!({ "reason": "" })), None);
         assert_eq!(body(serde_json::json!({ "reason": 7 })), None);
         assert_eq!(body(serde_json::json!({ "reason": { "kind": "x" } })), None);
+    }
+
+    #[test]
+    fn tool_result_title_prefers_the_wrapper_summary_over_tool_family() {
+        // O que safe_tool_body monta para um post-tool-use de agente fechado.
+        let body = "tool_family: file\ntool_call_id: toolu_01AB\noutcome: success\n---\nRead: D:/w/x.rs  ->  412 linhas";
+        assert_eq!(
+            tool_result_title(body).as_deref(),
+            Some("Read: D:/w/x.rs  ->  412 linhas")
+        );
+
+        // pre-tool-use nao tem separador: sem titulo, cai no safe_tool_title.
+        assert!(tool_result_title("tool_family: non-file\ntool_call_id: toolu_01AB").is_none());
+
+        // resultado vazio tambem cai no fallback.
+        assert!(tool_result_title("tool_family: file\noutcome: success\n---\n   \n").is_none());
+
+        // titulo longo sai inteiro: o corte de 80 e do Sanitized::new, depois
+        // da redacao (#980) -- cortar aqui poderia partir um segredo.
+        let longo = format!(
+            "tool_family: file\noutcome: success\n---\n{}",
+            "x".repeat(500)
+        );
+        let t = tool_result_title(&longo).expect("titulo");
+        assert_eq!(
+            t.chars().count(),
+            500,
+            "titulo com {} chars",
+            t.chars().count()
+        );
     }
 
     /// Title-hint extraction must truncate at the first newline (the
@@ -2960,7 +3036,11 @@ mod tests {
             }),
         );
         assert_eq!(post.agent, AgentKind::Cursor);
-        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        // Patch local: titulo = 1a linha do resultado (`tool_result_title`).
+        assert_eq!(
+            post.title_hint.as_deref(),
+            Some(r#"{"output":"MARKER_CURSOR_OUTPUT","exitCode":0}"#)
+        );
         let body = post.body_excerpt.expect("cursor post-tool body");
         assert!(body.contains("MARKER_CURSOR_OUTPUT"), "{body:?}");
 
@@ -3007,7 +3087,8 @@ mod tests {
             }),
         );
         assert_eq!(v3.agent, AgentKind::KiroCli);
-        assert_eq!(v3.title_hint.as_deref(), Some("tool file"));
+        // Patch local: titulo = 1a linha do resultado (`tool_result_title`).
+        assert_eq!(v3.title_hint.as_deref(), Some("MARKER_KIRO_V3_OUTPUT"));
         let body = v3.body_excerpt.expect("kiro v3 post-tool body");
         assert!(body.contains("MARKER_KIRO_V3_OUTPUT"), "{body:?}");
 
@@ -3025,7 +3106,10 @@ mod tests {
                 "tool_response": {"success": true, "result": ["MARKER_KIRO_V2_OUTPUT"]},
             }),
         );
-        assert_eq!(v2.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(
+            v2.title_hint.as_deref(),
+            Some(r#"{"success":true,"result":["MARKER_KIRO_V2_OUTPUT"]}"#)
+        );
         let body = v2.body_excerpt.expect("kiro v2 post-tool body");
         assert!(body.contains("outcome: success"), "{body:?}");
         assert!(body.contains("MARKER_KIRO_V2_OUTPUT"), "{body:?}");
@@ -3067,7 +3151,11 @@ mod tests {
                 "tool_use_id": "toolu_1186",
             }),
         );
-        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        // Patch local: titulo = 1a linha do resultado (`tool_result_title`).
+        assert_eq!(
+            post.title_hint.as_deref(),
+            Some(r#"{"stdout":"MARKER_POWERSHELL_1186","stderr":""}"#)
+        );
         let body = post.body_excerpt.expect("powershell post-tool body");
         assert!(body.contains("tool_family: non-file"), "{body:?}");
         assert!(body.contains("MARKER_POWERSHELL_1186"), "{body:?}");
@@ -3221,7 +3309,14 @@ mod tests {
                 assert_eq!(env.agent, AgentKind::Codex);
                 assert_eq!(env.session_id.as_deref(), Some("native-codex"));
                 assert_eq!(env.cwd.as_deref(), Some("/repo"));
-                assert_eq!(env.title_hint, Some(format!("tool {family}")));
+                // Patch local: no post-tool-use o titulo vem da primeira linha
+                // do resultado (`tool_result_title`); "tool <family>" e so o
+                // fallback do pre-tool-use, que nao tem resultado.
+                if event == "PreToolUse" {
+                    assert_eq!(env.title_hint, Some(format!("tool {family}")));
+                } else {
+                    assert!(env.title_hint.as_deref().is_some_and(|t| !t.is_empty()));
+                }
                 let body = env.body_excerpt.unwrap();
                 assert!(body.starts_with(&format!(
                     "tool_family: {family}\ntool_call_id: call-native-1"
@@ -3858,7 +3953,8 @@ mod tests {
             },
             serde_json::json!({"tool":"bash","callID":"omp-1","args":{"command":"SENTINEL_COMMAND"},"output":"tests passed","details":{"diff":"SENTINEL_DETAILS"}}),
         );
-        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        // Patch local: titulo = 1a linha do resultado, sem os args.
+        assert_eq!(post.title_hint.as_deref(), Some("tests passed"));
         assert_eq!(
             post.body_excerpt.as_deref(),
             Some("tool_family: non-file\ntool_call_id: omp-1\noutcome: unknown\n---\ntests passed")

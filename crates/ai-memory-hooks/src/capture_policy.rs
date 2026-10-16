@@ -1425,6 +1425,9 @@ pub const FILE_TOOL_NAMES: &[&str] = &[
     "edit_file",
     "patch",
     "read_many_files",
+    // Patch local: leitura do Antigravity.
+    "view_code_item",
+    "view_line_range",
 ];
 
 /// Search and list tools, whose output under an active policy is dropped.
@@ -1445,6 +1448,9 @@ pub const SEARCH_LIST_TOOL_NAMES: &[&str] = &[
     "find_by_name",
     "list_directory",
     "search_file_content",
+    // Patch local: busca do Antigravity.
+    "codebase_search",
+    "search_in_file",
 ];
 
 /// Tools that name no workspace file path of their own: shells (Claude Code's
@@ -1476,6 +1482,17 @@ pub const NON_FILE_TOOL_NAMES: &[&str] = &[
     "web_extract",
     "web_fetch",
     "delegate_task",
+    // Patch local: shell/agente do Claude Code e tools do Antigravity que
+    // caiam em `Unknown` (observacao sem corpo, titulo "tool unknown").
+    "pwsh",
+    "task",
+    "skill",
+    "command_status",
+    "read_terminal",
+    "create_memory",
+    "todo_write",
+    "todowrite",
+    "suggested_responses",
 ];
 
 /// Non-file tools whose input is program source (Hermes `execute_code`,
@@ -1495,6 +1512,11 @@ pub const OUTPUT_READER_TOOL_NAMES: &[&str] = &[
     "write_bash",
     "read_powershell",
     "write_powershell",
+    // Patch local: Antigravity le a saida de um `run_command` anterior. Ficam
+    // non-file (corpo capturado sem politica), mas sob `ignore_paths` caem em
+    // metadata-only como os demais.
+    "command_status",
+    "read_terminal",
 ];
 
 fn family(name: &str) -> ToolFamily {
@@ -4675,6 +4697,34 @@ mod tests {
         );
     }
 
+    /// Um nome nao classificado vira `ToolFamily::Unknown`, e `safe_tool_body`
+    /// descarta o resultado inteiro nesse caso: sobra uma observacao sem corpo
+    /// e sem titulo util. Os tools de shell/agente do Claude Code precisam
+    /// estar no mapa por isso.
+    #[test]
+    fn claude_code_shell_and_agent_tools_are_non_file_not_unknown() {
+        for tool in ["powershell", "pwsh", "task", "skill"] {
+            assert_eq!(family(tool), ToolFamily::NonFile, "tool: {tool}");
+        }
+        // Ferramentas que o antigravity chama de verdade e que caiam em
+        // `Unknown` viravam observacao vazia com titulo "tool unknown".
+        for tool in [
+            "search_web",
+            "command_status",
+            "read_terminal",
+            "todo_write",
+            "suggested_responses",
+        ] {
+            assert_eq!(family(tool), ToolFamily::NonFile, "tool: {tool}");
+        }
+        for tool in ["codebase_search", "find_by_name"] {
+            assert_eq!(family(tool), ToolFamily::SearchList, "tool: {tool}");
+        }
+        for tool in ["view_code_item", "view_line_range"] {
+            assert_eq!(family(tool), ToolFamily::File, "tool: {tool}");
+        }
+    }
+
     #[test]
     fn hermes_documented_tool_names_map_to_canonical_families() {
         for (tool, expected) in [
@@ -6323,6 +6373,36 @@ mod tests {
                 .disposition(),
             CaptureDisposition::Keep
         );
+    }
+
+    /// Patch local: os leitores de saida do Antigravity sao non-file (corpo
+    /// capturado sem politica), mas sob politica nao podem devolver a saida de
+    /// um `run_command` que a politica descartou.
+    #[test]
+    fn antigravity_output_readers_are_metadata_only_under_a_policy() {
+        let active = shell_policy();
+        let inactive = CapturePolicy::resolve(CaptureSource::Absent, "/repo", None);
+        for name in ["command_status", "read_terminal"] {
+            let reader = json!({
+                "toolCall": {"name": name, "args": {"CommandId": "c1"}},
+                "toolResult": "PRIVATE_BODY_SENTINEL",
+            });
+            let decision = active.inspect(AgentKind::AntigravityCli, &reader, "/repo");
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::MetadataOnly,
+                "{name}"
+            );
+            let body = metadata_only_body(Some("s"), Some("/repo"), &decision).to_string();
+            assert!(!body.contains("PRIVATE_BODY_SENTINEL"), "{name}: {body}");
+            let free = inactive.inspect(AgentKind::AntigravityCli, &reader, "/repo");
+            assert_eq!(
+                free.protocol().disposition(),
+                CaptureDisposition::Keep,
+                "{name}"
+            );
+            assert_eq!(free.protocol().tool_family(), ToolFamily::NonFile, "{name}");
+        }
     }
 
     /// A file a harness saved a tool's output to (Claude Code's
