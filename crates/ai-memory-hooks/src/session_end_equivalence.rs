@@ -213,7 +213,11 @@ fn tally_session(observations: &[Observation]) -> SessionTally<'_> {
             // that never produced a post (cancellations) are intentionally
             // excluded.
             ObservationKind::PostToolUse if !obs.title.is_empty() => {
-                *tally.tool_counts.entry(obs.title.as_str()).or_insert(0) += 1;
+                let name = obs
+                    .title
+                    .split_once(": ")
+                    .map_or(obs.title.as_str(), |(name, _)| name);
+                *tally.tool_counts.entry(name).or_insert(0) += 1;
             }
             _ => {}
         }
